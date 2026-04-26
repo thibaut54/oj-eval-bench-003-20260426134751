@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <set>
 #include <unordered_map>
 #include <algorithm>
 #include <memory>
@@ -45,33 +44,29 @@ struct Team {
     int idx = 0;
     int solved_count = 0;
     int penalty = 0;
-    vector<int> solve_times;            // sorted descending
+    int solve_times[MAX_PROB];          // sorted descending, length = solved_count
     vector<ProblemState> problems;      // size M
     int frozen_problem_count = 0;
+    unsigned int frozen_mask = 0;       // bit i set if problem i is frozen
     // last_sub[problem (0..M-1, MAX_PROB=ALL)][status (0..3, STAT_ALL=4)]
     LastSub last_sub[MAX_PROB + 1][5];
 
     int smallestFrozenProblem() const {
-        for (size_t i = 0; i < problems.size(); ++i) {
-            if (problems[i].frozen) return (int)i;
-        }
-        return -1;
+        if (frozen_mask == 0) return -1;
+        return __builtin_ctz(frozen_mask);
     }
 };
 
-struct TeamCmp {
-    bool operator()(const Team* a, const Team* b) const {
-        if (a->solved_count != b->solved_count) return a->solved_count > b->solved_count;
-        if (a->penalty != b->penalty) return a->penalty < b->penalty;
-        const auto& sa = a->solve_times;
-        const auto& sb = b->solve_times;
-        // Same solved_count guarantees same size
-        for (size_t i = 0; i < sa.size(); ++i) {
-            if (sa[i] != sb[i]) return sa[i] < sb[i]; // smaller max wins
-        }
-        return a->name < b->name;
+// Strict comparator: a ranks higher than b (returns true if a should come BEFORE b)
+static inline bool rankLess(const Team* a, const Team* b) {
+    if (a->solved_count != b->solved_count) return a->solved_count > b->solved_count;
+    if (a->penalty != b->penalty) return a->penalty < b->penalty;
+    int n = a->solved_count;
+    for (int i = 0; i < n; ++i) {
+        if (a->solve_times[i] != b->solve_times[i]) return a->solve_times[i] < b->solve_times[i];
     }
-};
+    return a->name < b->name;
+}
 
 static int g_M = 0;
 static bool g_started = false;
@@ -79,12 +74,17 @@ static bool g_freeze_active = false;
 static vector<std::unique_ptr<Team>> g_teams_storage;
 static vector<Team*> g_teams;
 static std::unordered_map<string, Team*> g_name2team;
-static std::set<Team*, TeamCmp> g_live;
-static vector<Team*> g_displayed;
+
+// Live ranking maintained as sorted vector. Index 0 is rank 1 (best).
+static vector<Team*> g_ranking;
+// team_idx -> current position in g_ranking
+static vector<int> g_pos_in_ranking;
+// Snapshot of ranking at last flush; used for QUERY_RANKING. Indexed by team idx.
 static vector<int> g_displayed_rank;
 
 // Output buffer
-static char g_obuf[1 << 24];
+static constexpr int OBUF_SZ = 1 << 22;
+static char g_obuf[OBUF_SZ];
 static int g_olen = 0;
 
 inline void out_flush() {
@@ -94,21 +94,17 @@ inline void out_flush() {
     }
 }
 
-inline void out_ensure(int extra) {
-    if (g_olen + extra > (int)sizeof(g_obuf)) out_flush();
-}
-
 inline void out_str(const char* s) {
     while (*s) {
-        if (g_olen >= (int)sizeof(g_obuf)) out_flush();
+        if (g_olen >= OBUF_SZ) out_flush();
         g_obuf[g_olen++] = *s++;
     }
 }
 
 inline void out_str_n(const char* s, int n) {
     while (n > 0) {
-        int avail = (int)sizeof(g_obuf) - g_olen;
-        if (avail == 0) { out_flush(); avail = sizeof(g_obuf); }
+        int avail = OBUF_SZ - g_olen;
+        if (avail == 0) { out_flush(); avail = OBUF_SZ; }
         int copy = n < avail ? n : avail;
         memcpy(g_obuf + g_olen, s, copy);
         g_olen += copy;
@@ -118,17 +114,18 @@ inline void out_str_n(const char* s, int n) {
 }
 
 inline void out_char(char c) {
-    if (g_olen >= (int)sizeof(g_obuf)) out_flush();
+    if (g_olen >= OBUF_SZ) out_flush();
     g_obuf[g_olen++] = c;
 }
 
 inline void out_int(int x) {
-    char buf[16];
+    if (g_olen + 12 > OBUF_SZ) out_flush();
+    if (x == 0) { g_obuf[g_olen++] = '0'; return; }
+    if (x < 0) { g_obuf[g_olen++] = '-'; x = -x; }
+    char buf[12];
     int n = 0;
-    if (x == 0) { out_char('0'); return; }
-    if (x < 0) { out_char('-'); x = -x; }
-    while (x > 0) { buf[n++] = '0' + (x % 10); x /= 10; }
-    while (n > 0) out_char(buf[--n]);
+    while (x > 0) { buf[n++] = (char)('0' + (x % 10)); x /= 10; }
+    while (n > 0) g_obuf[g_olen++] = buf[--n];
 }
 
 static int statusFromString(const char* s) {
@@ -150,22 +147,56 @@ static const char* statusToString(int s) {
     }
 }
 
-static void addSolveTime(Team* t, int time) {
-    auto& v = t->solve_times;
-    auto it = std::lower_bound(v.begin(), v.end(), time, std::greater<int>());
-    v.insert(it, time);
+// Insert time into team's solve_times keeping it sorted descending.
+static inline void addSolveTime(Team* t, int time) {
+    int n = t->solved_count - 1; // new count assumed already incremented; actual length stored is solved_count - 1 before insert
+    // Find insertion index in [0..n] for sorted-desc; smaller indices have larger values.
+    int i = n;
+    while (i > 0 && t->solve_times[i - 1] < time) {
+        t->solve_times[i] = t->solve_times[i - 1];
+        --i;
+    }
+    t->solve_times[i] = time;
 }
 
-static void rebuildDisplayed() {
-    g_displayed.assign(g_live.begin(), g_live.end());
-    if ((int)g_displayed_rank.size() < (int)g_displayed.size())
-        g_displayed_rank.assign(g_displayed.size(), 0);
-    for (size_t i = 0; i < g_displayed.size(); ++i) {
-        g_displayed_rank[g_displayed[i]->idx] = (int)i;
+// Bubble up team t (whose metrics just improved) to its correct position.
+static inline void bubbleUp(Team* t) {
+    int p = g_pos_in_ranking[t->idx];
+    while (p > 0 && rankLess(g_ranking[p], g_ranking[p - 1])) {
+        Team* above = g_ranking[p - 1];
+        g_ranking[p - 1] = t;
+        g_ranking[p] = above;
+        g_pos_in_ranking[above->idx] = p;
+        --p;
+    }
+    g_pos_in_ranking[t->idx] = p;
+}
+
+// Like bubbleUp but only used during scroll; returns the original position.
+// Returns the new position.
+static inline int bubbleUpAt(int original_pos) {
+    Team* t = g_ranking[original_pos];
+    int p = original_pos;
+    while (p > 0 && rankLess(g_ranking[p], g_ranking[p - 1])) {
+        Team* above = g_ranking[p - 1];
+        g_ranking[p - 1] = t;
+        g_ranking[p] = above;
+        g_pos_in_ranking[above->idx] = p;
+        --p;
+    }
+    g_pos_in_ranking[t->idx] = p;
+    return p;
+}
+
+static inline void rebuildDisplayedRank() {
+    if ((int)g_displayed_rank.size() < (int)g_ranking.size())
+        g_displayed_rank.assign(g_ranking.size(), 0);
+    for (size_t i = 0; i < g_ranking.size(); ++i) {
+        g_displayed_rank[g_ranking[i]->idx] = (int)i;
     }
 }
 
-static void recordSubmission(Team* t, int p, int s, int time) {
+static inline void recordSubmission(Team* t, int p, int s, int time) {
     LastSub sub{p, s, time, true};
     t->last_sub[p][s] = sub;
     t->last_sub[p][STAT_ALL] = sub;
@@ -189,7 +220,6 @@ static void doAddTeam(const string& name) {
     g_teams_storage.push_back(std::move(up));
     g_teams.push_back(p);
     g_name2team[name] = p;
-    g_live.insert(p);
     out_str("[Info]Add successfully.\n");
 }
 
@@ -203,20 +233,29 @@ static void doStart(int /*duration*/, int problemCount) {
     for (Team* t : g_teams) {
         t->problems.assign(g_M, ProblemState{});
     }
+    // Build initial ranking sorted by name (lex order)
+    g_ranking = g_teams;
+    std::sort(g_ranking.begin(), g_ranking.end(),
+              [](Team* a, Team* b){ return a->name < b->name; });
+    g_pos_in_ranking.assign(g_teams.size(), 0);
+    for (size_t i = 0; i < g_ranking.size(); ++i) {
+        g_pos_in_ranking[g_ranking[i]->idx] = (int)i;
+    }
     g_displayed_rank.assign(g_teams.size(), 0);
-    rebuildDisplayed();
+    rebuildDisplayedRank();
     out_str("[Info]Competition starts.\n");
 }
 
 static void doSubmit(Team* t, int p, int s, int time) {
     recordSubmission(t, p, s, time);
     auto& ps = t->problems[p];
-    if (ps.solved) return; // already solved, just record
+    if (ps.solved) return;
 
     if (g_freeze_active) {
         if (!ps.frozen) {
             ps.frozen = true;
             t->frozen_problem_count++;
+            t->frozen_mask |= (1u << p);
         }
         ps.frozen_subs_count++;
         if (s == STAT_AC && ps.first_ac_in_freeze == -1) {
@@ -227,14 +266,13 @@ static void doSubmit(Team* t, int p, int s, int time) {
     }
 
     if (s == STAT_AC) {
-        g_live.erase(t);
         ps.solved = true;
         ps.solve_time = time;
         ps.wrong_before_ac = ps.wrong_attempts;
         t->solved_count++;
         t->penalty += 20 * ps.wrong_before_ac + time;
         addSolveTime(t, time);
-        g_live.insert(t);
+        bubbleUp(t);
     } else {
         ps.wrong_attempts++;
     }
@@ -245,6 +283,7 @@ static void unfreezeProblem(Team* t, int p) {
     if (!ps.frozen) return;
     ps.frozen = false;
     t->frozen_problem_count--;
+    t->frozen_mask &= ~(1u << p);
 
     if (ps.first_ac_in_freeze != -1) {
         ps.solved = true;
@@ -284,9 +323,9 @@ static void writeCell(const ProblemState& ps) {
     }
 }
 
-static void printScoreboard(const vector<Team*>& rank) {
-    for (size_t i = 0; i < rank.size(); ++i) {
-        Team* t = rank[i];
+static void printScoreboard() {
+    for (size_t i = 0; i < g_ranking.size(); ++i) {
+        Team* t = g_ranking[i];
         out_str_n(t->name.data(), (int)t->name.size());
         out_char(' ');
         out_int((int)i + 1);
@@ -304,7 +343,7 @@ static void printScoreboard(const vector<Team*>& rank) {
 
 static void doFlush() {
     out_str("[Info]Flush scoreboard.\n");
-    rebuildDisplayed();
+    rebuildDisplayedRank();
 }
 
 static void doFreeze() {
@@ -322,30 +361,25 @@ static void doScroll() {
         return;
     }
     out_str("[Info]Scroll scoreboard.\n");
-    // Implicit flush: displayed = current live ranking
-    rebuildDisplayed();
-    printScoreboard(g_displayed);
+    // Implicit flush: snapshot displayed ranks
+    rebuildDisplayedRank();
+    printScoreboard();
 
-    // Build a vector from live ranking to do bubble-up
-    vector<Team*> vec(g_live.begin(), g_live.end());
-    int n = (int)vec.size();
-    TeamCmp cmp;
+    int n = (int)g_ranking.size();
     int i = n - 1;
     while (i >= 0) {
-        Team* T = vec[i];
+        Team* T = g_ranking[i];
         if (T->frozen_problem_count == 0) {
             --i;
             continue;
         }
         int p = T->smallestFrozenProblem();
         unfreezeProblem(T, p);
-        int new_i = i;
-        while (new_i > 0 && cmp(vec[new_i], vec[new_i - 1])) {
-            std::swap(vec[new_i], vec[new_i - 1]);
-            --new_i;
-        }
+        // Bubble T up if AC during freeze improved its rank
+        int new_i = bubbleUpAt(i);
         if (new_i < i) {
-            Team* team2 = vec[new_i + 1];
+            // Output: T moved from i to new_i, the team currently at new_i+1 was the displaced one
+            Team* team2 = g_ranking[new_i + 1];
             out_str_n(T->name.data(), (int)T->name.size());
             out_char(' ');
             out_str_n(team2->name.data(), (int)team2->name.size());
@@ -355,17 +389,12 @@ static void doScroll() {
             out_int(T->penalty);
             out_char('\n');
         }
-        // i stays the same; loop re-evaluates vec[i] (now possibly different team)
+        // i unchanged: ranking[i] may now be a different team
     }
 
     g_freeze_active = false;
-    g_live.clear();
-    for (Team* t : vec) g_live.insert(t);
-    g_displayed = vec;
-    for (size_t k = 0; k < g_displayed.size(); ++k) {
-        g_displayed_rank[g_displayed[k]->idx] = (int)k;
-    }
-    printScoreboard(g_displayed);
+    rebuildDisplayedRank();
+    printScoreboard();
 }
 
 static void queryRanking(const string& name) {
@@ -410,13 +439,13 @@ static void querySubmission(const string& name, const char* probStr, const char*
     out_char('\n');
 }
 
-// Skip spaces (incl. tabs)
+// ---------- Input parsing ----------
+
 static inline const char* skipSp(const char* p) {
     while (*p == ' ' || *p == '\t') ++p;
     return p;
 }
 
-// Read a non-space token; returns ptr after the token. Writes nul-terminated token to out.
 static inline const char* readTok(const char* p, char* out, int outSize) {
     p = skipSp(p);
     int n = 0;
@@ -428,7 +457,6 @@ static inline const char* readTok(const char* p, char* out, int outSize) {
     return p;
 }
 
-// Read int; returns ptr after.
 static inline const char* readInt(const char* p, int* val) {
     p = skipSp(p);
     int v = 0;
@@ -439,7 +467,6 @@ static inline const char* readInt(const char* p, int* val) {
     return p;
 }
 
-// Read until end-of-line, space, or '='; for QUERY_SUBMISSION keys like PROBLEM
 static inline const char* readUntilSpaceOrEq(const char* p, char* out, int outSize) {
     p = skipSp(p);
     int n = 0;
@@ -452,7 +479,6 @@ static inline const char* readUntilSpaceOrEq(const char* p, char* out, int outSi
 }
 
 static inline const char* readKVValue(const char* p, char* out, int outSize) {
-    // After "KEY", expect '=' then value
     p = skipSp(p);
     if (*p == '=') ++p;
     int n = 0;
@@ -478,13 +504,12 @@ int main() {
         if (!strcmp(cmd, "SUBMIT")) {
             char probStr[8], teamName[32], statusStr[24];
             int t;
-            p = readTok(p, probStr, sizeof(probStr));        // problem
-            p = readTok(p, teamName, sizeof(teamName));      // BY
-            p = readTok(p, teamName, sizeof(teamName));      // team
-            p = readTok(p, statusStr, sizeof(statusStr));    // WITH
-            p = readTok(p, statusStr, sizeof(statusStr));    // status
-            // skip "AT"
             char tmp[8];
+            p = readTok(p, probStr, sizeof(probStr));        // problem
+            p = readTok(p, tmp, sizeof(tmp));                // BY
+            p = readTok(p, teamName, sizeof(teamName));      // team
+            p = readTok(p, tmp, sizeof(tmp));                // WITH
+            p = readTok(p, statusStr, sizeof(statusStr));    // status
             p = readTok(p, tmp, sizeof(tmp));                // AT
             p = readInt(p, &t);
             int prob = probStr[0] - 'A';
@@ -511,13 +536,12 @@ int main() {
             char name[32], prob[16], status[24];
             char tmp[16];
             p = readTok(p, name, sizeof(name));
-            p = readTok(p, tmp, sizeof(tmp));   // WHERE
-            // tmp may be "WHERE"; next token is PROBLEM=X
+            p = readTok(p, tmp, sizeof(tmp));                // WHERE
             p = readUntilSpaceOrEq(p, tmp, sizeof(tmp));     // PROBLEM
-            p = readKVValue(p, prob, sizeof(prob));          // =X
-            p = readTok(p, tmp, sizeof(tmp));   // AND
+            p = readKVValue(p, prob, sizeof(prob));
+            p = readTok(p, tmp, sizeof(tmp));                // AND
             p = readUntilSpaceOrEq(p, tmp, sizeof(tmp));     // STATUS
-            p = readKVValue(p, status, sizeof(status));      // =Y
+            p = readKVValue(p, status, sizeof(status));
             querySubmission(name, prob, status);
         } else if (!strcmp(cmd, "START")) {
             char tmp[16];
